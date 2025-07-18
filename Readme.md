@@ -76,29 +76,10 @@ After applying these changes:
    - Ensure your system has enough free RAM to hold indexes (about 5–10 MB per active user).
    - Use `du -sh /var/lib/dovecot-*` to estimate needed `tmpfs` size.
 
-2. **Backup index and cache if needed (optional)**
-   - These are ephemeral — they’re regenerated if lost, but you can persist them with:
-     ```bash
-     rsync -a /var/lib/dovecot-index/ /mnt/backup/index/
-     ```
-
-3. **Restart Dovecot after changes**
+2. **Restart Dovecot after changes**
    ```bash
    systemctl restart dovecot
    ```
-
-## 📥 Sample `/etc/dovecot/conf.d/10-mail.conf` Snippet
-
-```ini
-mail_location = maildir:~/Maildir
-
-mail_index_path = /var/lib/dovecot-index/%{user | domain}/%{user | username}
-mail_cache_path = /var/lib/dovecot-cache/%{user | domain}/%{user | username}
-mail_control_path = /var/lib/dovecot-control/%{user | domain}/%{user | username}
-
-first_valid_uid = 1000
-first_valid_gid = 8
-```
 
 ## ✅ Final Notes
 
@@ -131,16 +112,51 @@ sudo chown -R dovecot:mail /var/backups/dovecot/
 Create the file:
 
 ```bash
-sudo nano /usr/local/bin/backup-dovecot-tmpfs.sh
+sudo vi /usr/local/bin/backup-dovecot-tmpfs.sh
 ```
 
 Contents:
 
 ```bash
 #!/bin/bash
-rsync -a --delete /var/lib/dovecot-control/ /var/backups/dovecot/control/
-rsync -a --delete /var/lib/dovecot-index/ /var/backups/dovecot/index/
-rsync -a --delete /var/lib/dovecot-cache/ /var/backups/dovecot/cache/
+
+LOCKFILE="/var/lock/dovecot-tmpfs-backup.lock"
+LOCK_MAX_AGE=3600
+
+if [ -f "$LOCKFILE" ]; then
+  AGE=$(($(date +%s) - $(stat -c %Y "$LOCKFILE")))
+  if [ "$AGE" -gt "$LOCK_MAX_AGE" ]; then
+    echo "[$(date)] Lockfile too old ($AGE sec), removing stale lock."
+    rm -f "$LOCKFILE"
+  fi
+fi
+
+exec 200>"$LOCKFILE"
+flock -n 200 || { echo "[$(date)] Backup or restore already running, exiting."; exit 1; }
+
+# dovecot tmpfs backup with safeguard
+check_and_backup() {
+  SRC="$1"
+  DST="$2"
+  MIN_FILES=20
+
+  COUNT=$(find "$SRC" -type f 2>/dev/null | wc -l)
+
+  if [ "$COUNT" -lt "$MIN_FILES" ]; then
+    echo "[$(date)] Skipping backup of $SRC: only $COUNT files found (probably empty tmpfs)"
+    return
+  fi
+
+  echo "[$(date)] Backing up $SRC to $DST"
+  rsync -a --delete "$SRC/" "$DST/"
+}
+
+check_and_backup "/var/lib/dovecot-control" "/var/backups/dovecot/control"
+check_and_backup "/var/lib/dovecot-index" "/var/backups/dovecot/index"
+check_and_backup "/var/lib/dovecot-cache" "/var/backups/dovecot/cache"
+
+flock -u 200
+rm -f "$LOCKFILE"
 ```
 
 Then make it executable:
@@ -163,9 +179,35 @@ Contents:
 
 ```bash
 #!/bin/bash
-rsync -a /var/backups/dovecot/control/ /var/lib/dovecot-control/
-rsync -a /var/backups/dovecot/index/ /var/lib/dovecot-index/
-rsync -a /var/backups/dovecot/cache/ /var/lib/dovecot-cache/
+
+LOCKFILE="/var/lock/dovecot-tmpfs.lock"
+LOCK_MAX_AGE=3600
+
+if [ -f "$LOCKFILE" ]; then
+  AGE=$(($(date +%s) - $(stat -c %Y "$LOCKFILE")))
+  if [ "$AGE" -gt "$LOCK_MAX_AGE" ]; then
+    echo "[$(date)] Lockfile too old ($AGE sec), removing stale lock."
+    rm -f "$LOCKFILE"
+  fi
+fi
+
+exec 200>"$LOCKFILE"
+flock -n 200 || { echo "[$(date)] Backup or restore already running, exiting."; exit 1; }
+
+restore_dir() {
+  SRC="$1"
+  DST="$2"
+
+  echo "[$(date)] Restoring $SRC to $DST"
+  rsync -a "$SRC/" "$DST/"
+}
+
+restore_dir "/var/backups/dovecot/control" "/var/lib/dovecot-control"
+restore_dir "/var/backups/dovecot/index" "/var/lib/dovecot-index"
+restore_dir "/var/backups/dovecot/cache" "/var/lib/dovecot-cache"
+
+flock -u 200
+rm -f "$LOCKFILE"
 ```
 
 Make it executable:
@@ -234,8 +276,6 @@ If the `tmpfs` directories are mounted and a backup exists, this will restore th
 
 ---
 
----
-
 ## 📂 Migrating Subscriptions and Metadata Files to Dovecot Control Path
 
 To improve performance and consistency, it is also recommended to move the following metadata files into the `mail_control_path` (`/var/lib/dovecot-control`):
@@ -245,6 +285,8 @@ To improve performance and consistency, it is also recommended to move the follo
 - `dovecot-uidvalidity*`
 
 You can automate this process with the following script:
+
+migrate-dovecot-files.sh
 
 ```bash
 for name in subscriptions dovecot-keywords "dovecot-uidvalidity*"; do
